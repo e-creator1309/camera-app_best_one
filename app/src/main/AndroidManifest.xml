@@ -2,6 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-permission android:name="android.permission.CAMERA" />
+    <!-- Optional at runtime: video recording still works without it, just without sound. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-feature
         android:name="android.hardware.camera.any"
         android:required="true" />

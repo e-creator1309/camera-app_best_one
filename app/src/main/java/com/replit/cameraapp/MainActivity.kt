@@ -37,9 +37,22 @@ import androidx.camera.core.Preview
 import androidx.camera.core.UseCaseGroup
 import androidx.camera.core.ViewPort
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.MediaStoreOutputOptions
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
 import androidx.camera.view.PreviewView
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -164,6 +177,18 @@ private enum class PhotoFilter(val label: String) {
     fun next(): PhotoFilter = entries[(ordinal + 1) % entries.size]
 }
 
+/**
+ * The capture category shown in the row above the shutter. Only [PHOTO] and [VIDEO] are wired
+ * up to real camera behavior; [PORTRAIT] and [MORE] are placeholders reserved for later work --
+ * selecting them is purely cosmetic and falls back to the same behavior as [PHOTO].
+ */
+private enum class CaptureMode(val label: String) {
+    PHOTO("PHOTO"),
+    VIDEO("VIDEO"),
+    PORTRAIT("PORTRAIT"),
+    MORE("MORE")
+}
+
 /** Which full-screen page is currently shown over the camera preview. */
 private enum class Screen { CAMERA, SETTINGS }
 
@@ -217,12 +242,18 @@ private fun CameraScreen() {
     }
 
     val permissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted -> hasCameraPermission = granted }
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { results ->
+        // Audio permission can be requested separately later (e.g. the first time Video
+        // mode is selected), so only touch hasCameraPermission when it was actually asked.
+        if (results.containsKey(Manifest.permission.CAMERA)) {
+            hasCameraPermission = results[Manifest.permission.CAMERA] == true
+        }
+    }
 
     LaunchedEffect(Unit) {
         if (!hasCameraPermission) {
-            permissionLauncher.launch(Manifest.permission.CAMERA)
+            permissionLauncher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
         }
     }
 
@@ -254,7 +285,7 @@ private fun CameraScreen() {
             }
         } else {
             PermissionRationale(onRequestPermission = {
-                permissionLauncher.launch(Manifest.permission.CAMERA)
+                permissionLauncher.launch(arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO))
             })
         }
     }
@@ -288,6 +319,25 @@ private fun CameraContent(
     var detectedDocument by remember { mutableStateOf<DetectedDocument?>(null) }
     var zoomIndicatorPulse by remember { mutableIntStateOf(0) }
     var zoomIndicatorVisible by remember { mutableStateOf(false) }
+    var captureMode by remember { mutableStateOf(CaptureMode.PHOTO) }
+    var videoCapture by remember { mutableStateOf<VideoCapture<Recorder>?>(null) }
+    var activeRecording by remember { mutableStateOf<Recording?>(null) }
+    var isRecording by remember { mutableStateOf(false) }
+    var recordingSeconds by remember { mutableIntStateOf(0) }
+
+    // Requested the first time Video is selected, in case the initial permission prompt
+    // (which also asks for it) was skipped because camera access was already granted from
+    // a previous version of the app. Recording still works without it, just silently.
+    val audioPermissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { }
+    LaunchedEffect(captureMode) {
+        if (captureMode == CaptureMode.VIDEO &&
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED
+        ) {
+            audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
 
     // Document scanning only runs on the back camera -- the front camera's mirrored preview
     // would need its own coordinate handling, and scanning a document via selfie camera isn't
@@ -335,7 +385,12 @@ private fun CameraContent(
         onDispose { documentAnalysisExecutor.shutdown() }
     }
 
-    LaunchedEffect(lensFacing, captureAspect, scanDocumentsEnabled) {
+    LaunchedEffect(lensFacing, captureAspect, scanDocumentsEnabled, captureMode) {
+        // Switching mode/lens/aspect tears down and rebinds the camera -- stop any in-flight
+        // recording first instead of leaving it dangling on an about-to-be-unbound camera.
+        activeRecording?.stop()
+        activeRecording = null
+        isRecording = false
         detectedDocument = null
 
         val cameraProvider = context.getCameraProvider()
@@ -343,27 +398,39 @@ private fun CameraContent(
             it.setSurfaceProvider(previewView.surfaceProvider)
         }
         val cameraSelector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
-        val newImageCapture = buildImageCapture(captureAspect)
-
-        val scanForThisBind = scanDocumentsEnabled && lensFacing == CameraSelector.LENS_FACING_BACK
-        val imageAnalysis = if (scanForThisBind) {
-            ImageAnalysis.Builder()
-                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                .build()
-                .also { analysis ->
-                    analysis.setAnalyzer(
-                        documentAnalysisExecutor,
-                        DocumentEdgeAnalyzer(previewView) { result -> detectedDocument = result }
-                    )
-                }
-        } else {
-            null
-        }
 
         val useCaseGroupBuilder = UseCaseGroup.Builder()
         useCaseGroupBuilder.addUseCase(preview)
-        useCaseGroupBuilder.addUseCase(newImageCapture)
-        imageAnalysis?.let { useCaseGroupBuilder.addUseCase(it) }
+
+        var newImageCapture: ImageCapture? = null
+        var newVideoCapture: VideoCapture<Recorder>? = null
+
+        if (captureMode == CaptureMode.VIDEO) {
+            val recorder = Recorder.Builder()
+                .setQualitySelector(QualitySelector.from(Quality.HIGHEST))
+                .build()
+            newVideoCapture = VideoCapture.withOutput(recorder)
+            useCaseGroupBuilder.addUseCase(newVideoCapture)
+        } else {
+            // Portrait and More are placeholders for later work -- they fall back to the
+            // same photo pipeline as Photo mode rather than doing anything special.
+            newImageCapture = buildImageCapture(captureAspect)
+            useCaseGroupBuilder.addUseCase(newImageCapture)
+
+            val scanForThisBind = scanDocumentsEnabled && lensFacing == CameraSelector.LENS_FACING_BACK
+            if (scanForThisBind) {
+                val imageAnalysis = ImageAnalysis.Builder()
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .build()
+                    .also { analysis ->
+                        analysis.setAnalyzer(
+                            documentAnalysisExecutor,
+                            DocumentEdgeAnalyzer(previewView) { result -> detectedDocument = result }
+                        )
+                    }
+                useCaseGroupBuilder.addUseCase(imageAnalysis)
+            }
+        }
 
         // A shared ViewPort keeps the analysis, preview, and capture crop rects aligned to the
         // same field of view, which is what makes the live document outline line up correctly.
@@ -377,7 +444,8 @@ private fun CameraContent(
         cameraProvider.unbindAll()
         try {
             camera = cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, useCaseGroupBuilder.build())
-            imageCapture = newImageCapture
+            newImageCapture?.let { imageCapture = it }
+            videoCapture = newVideoCapture
             flashOn = false
             zoomRatio = 1f
         } catch (exc: Exception) {
@@ -457,12 +525,87 @@ private fun CameraContent(
             }
         }
     }
-    val currentPerformCapture by rememberUpdatedState(performCapture)
+    val startOrStopRecording: () -> Unit = record@{
+        val activeVideoCapture = videoCapture
+        if (activeVideoCapture == null) {
+            return@record
+        }
+        if (isRecording) {
+            activeRecording?.stop()
+            return@record
+        }
+        if (isBusy) return@record
+        scope.launch {
+            isBusy = true
+            try {
+                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+
+                val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(System.currentTimeMillis())
+                val contentValues = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, "VID_$timestamp")
+                    put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, "Movies/CameraApp")
+                }
+                val outputOptions = MediaStoreOutputOptions.Builder(
+                    context.contentResolver,
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                ).setContentValues(contentValues).build()
+
+                val hasAudioPermission = ContextCompat.checkSelfPermission(
+                    context,
+                    Manifest.permission.RECORD_AUDIO
+                ) == PackageManager.PERMISSION_GRANTED
+
+                val pendingRecording = activeVideoCapture.output.prepareRecording(context, outputOptions).let {
+                    if (hasAudioPermission) it.withAudioEnabled() else it
+                }
+
+                activeRecording = pendingRecording.start(mainExecutor) { event ->
+                    when (event) {
+                        is VideoRecordEvent.Start -> {
+                            isRecording = true
+                            isBusy = false
+                        }
+                        is VideoRecordEvent.Finalize -> {
+                            isRecording = false
+                            activeRecording = null
+                            isBusy = false
+                            if (!event.hasError()) {
+                                lastPhotoUri = event.outputResults.outputUri
+                                capturedPop = true
+                            } else {
+                                Log.e("CameraApp", "Video recording finished with error: ${event.error}")
+                            }
+                        }
+                        else -> Unit
+                    }
+                }
+            } catch (exc: Exception) {
+                Log.e("CameraApp", "Failed to start video recording", exc)
+                isBusy = false
+            }
+        }
+    }
+
+    LaunchedEffect(isRecording) {
+        if (isRecording) {
+            recordingSeconds = 0
+            while (true) {
+                delay(1000)
+                recordingSeconds += 1
+            }
+        }
+    }
+
+    val onShutterClick: () -> Unit = {
+        if (captureMode == CaptureMode.VIDEO) startOrStopRecording() else performCapture()
+    }
+    val currentShutterClick by rememberUpdatedState(onShutterClick)
 
     // Let the hardware volume keys act as a physical shutter button, like Samsung Camera.
     DisposableEffect(Unit) {
         val activity = context as? MainActivity
-        activity?.onVolumeKeyPressed = { currentPerformCapture() }
+        activity?.onVolumeKeyPressed = { currentShutterClick() }
         onDispose { activity?.onVolumeKeyPressed = null }
     }
 
@@ -623,6 +766,17 @@ private fun CameraContent(
             modifier = Modifier.align(Alignment.CenterEnd).padding(end = 18.dp)
         )
 
+        // Recording badge -- a small pulsing dot plus an elapsed-time readout, shown only
+        // while actively recording video.
+        AnimatedVisibility(
+            visible = isRecording,
+            modifier = Modifier.align(Alignment.TopCenter).statusBarsPadding().padding(top = 12.dp),
+            enter = fadeIn(),
+            exit = fadeOut()
+        ) {
+            RecordingBadge(seconds = recordingSeconds)
+        }
+
         Column(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
@@ -647,27 +801,48 @@ private fun CameraContent(
                 modifier = Modifier.padding(bottom = 14.dp)
             )
 
-            AspectRatioSelector(
-                current = captureAspect,
-                onSelect = { captureAspect = it }
-            )
+            // Aspect ratio only applies to still photos, so it's hidden while Video is the
+            // active category instead of showing a control that would do nothing.
+            if (captureMode != CaptureMode.VIDEO) {
+                AspectRatioSelector(
+                    current = captureAspect,
+                    onSelect = { captureAspect = it }
+                )
+                Spacer(modifier = Modifier.height(14.dp))
+            }
 
-            Spacer(modifier = Modifier.height(18.dp))
+            // Category selector sitting right above the shutter -- Photo and Video switch
+            // real camera behavior; Portrait and More are reserved placeholders for later
+            // work and are purely cosmetic for now.
+            CaptureModeRow(
+                current = captureMode,
+                onSelect = { mode ->
+                    if (!isRecording) {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        captureMode = mode
+                    }
+                },
+                modifier = Modifier.padding(bottom = 14.dp)
+            )
 
             CameraControls(
                 modifier = Modifier.fillMaxWidth(),
                 lastPhotoUri = lastPhotoUri,
                 thumbnailPop = capturedPop,
                 flipSpins = flipSpins,
+                captureMode = captureMode,
+                isRecording = isRecording,
                 onThumbnailClick = { openGallery(context, lastPhotoUri) },
-                onCaptureClick = performCapture,
+                onCaptureClick = onShutterClick,
                 onFlipClick = {
-                    haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
-                    flipSpins += 1
-                    lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) {
-                        CameraSelector.LENS_FACING_FRONT
-                    } else {
-                        CameraSelector.LENS_FACING_BACK
+                    if (!isRecording) {
+                        haptics.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+                        flipSpins += 1
+                        lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) {
+                            CameraSelector.LENS_FACING_FRONT
+                        } else {
+                            CameraSelector.LENS_FACING_BACK
+                        }
                     }
                 }
             )
@@ -913,6 +1088,8 @@ private fun CameraControls(
     lastPhotoUri: Uri?,
     thumbnailPop: Boolean,
     flipSpins: Int,
+    captureMode: CaptureMode,
+    isRecording: Boolean,
     onThumbnailClick: () -> Unit,
     onCaptureClick: () -> Unit,
     onFlipClick: () -> Unit
@@ -923,8 +1100,85 @@ private fun CameraControls(
         verticalAlignment = Alignment.CenterVertically
     ) {
         ThumbnailButton(uri = lastPhotoUri, pop = thumbnailPop, onClick = onThumbnailClick)
-        ShutterButton(onClick = onCaptureClick)
+        ShutterButton(mode = captureMode, isRecording = isRecording, onClick = onCaptureClick)
         FlipButton(spins = flipSpins, onClick = onFlipClick)
+    }
+}
+
+/**
+ * The category selector shown above the shutter, e.g. Samsung Camera's Photo/Video/More row.
+ * Small, understated text labels -- the current one picked out in accent yellow and bold.
+ */
+@Composable
+private fun CaptureModeRow(
+    current: CaptureMode,
+    onSelect: (CaptureMode) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.spacedBy(22.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        CaptureMode.entries.forEach { mode ->
+            val isSelected = mode == current
+            val color by animateColorAsState(
+                targetValue = if (isSelected) Color(0xFFFFD54F) else Color.White.copy(alpha = 0.6f),
+                label = "captureModeColor"
+            )
+            Text(
+                text = mode.label,
+                color = color,
+                fontSize = if (isSelected) 13.sp else 12.sp,
+                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                letterSpacing = 0.6.sp,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(50))
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = { onSelect(mode) }
+                    )
+                    .padding(horizontal = 4.dp, vertical = 4.dp)
+            )
+        }
+    }
+}
+
+/** Small pulsing dot + elapsed-time readout shown while a video is actively recording. */
+@Composable
+private fun RecordingBadge(seconds: Int) {
+    val infinite = rememberInfiniteTransition(label = "recordingPulse")
+    val dotAlpha by infinite.animateFloat(
+        initialValue = 1f,
+        targetValue = 0.25f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 700),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "recordingDotAlpha"
+    )
+
+    Row(
+        modifier = Modifier
+            .clip(RoundedCornerShape(50))
+            .background(Color.Black.copy(alpha = 0.45f))
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .size(8.dp)
+                .clip(CircleShape)
+                .background(Color(0xFFFF3B30).copy(alpha = dotAlpha))
+        )
+        Text(
+            text = "%02d:%02d".format(seconds / 60, seconds % 60),
+            color = Color.White,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Bold
+        )
     }
 }
 
@@ -995,12 +1249,31 @@ private fun ThumbnailButton(uri: Uri?, pop: Boolean, onClick: () -> Unit) {
     }
 }
 
+/**
+ * Photo mode: a plain white circle, unchanged.
+ * Video mode: red instead of white to flag that pressing it records instead of snapping a
+ * photo. While recording, it morphs into a smaller red rounded square -- the universal
+ * "tap again to stop" shape -- so it's obvious a tap now ends the recording.
+ * Portrait/More fall back to the Photo look since they're inert placeholders.
+ */
 @Composable
-private fun ShutterButton(onClick: () -> Unit) {
+private fun ShutterButton(mode: CaptureMode, isRecording: Boolean, onClick: () -> Unit) {
     val interactionSource = remember { MutableInteractionSource() }
     val isPressed by interactionSource.collectIsPressedAsState()
     val outerScale by animateFloatAsState(if (isPressed) 0.9f else 1f, label = "shutterOuterScale")
-    val innerScale by animateFloatAsState(if (isPressed) 0.8f else 1f, label = "shutterInnerScale")
+    val innerPressScale by animateFloatAsState(if (isPressed) 0.8f else 1f, label = "shutterInnerPressScale")
+    val innerSizeFraction by animateFloatAsState(
+        targetValue = if (isRecording) 0.42f else 1f,
+        label = "shutterInnerSize"
+    )
+    val cornerRadius by animateDpAsState(
+        targetValue = if (isRecording) 8.dp else 40.dp,
+        label = "shutterCornerRadius"
+    )
+    val innerColor by animateColorAsState(
+        targetValue = if (mode == CaptureMode.VIDEO) Color(0xFFFF3B30) else Color.White,
+        label = "shutterInnerColor"
+    )
 
     Box(
         modifier = Modifier
@@ -1018,10 +1291,10 @@ private fun ShutterButton(onClick: () -> Unit) {
     ) {
         Box(
             modifier = Modifier
-                .fillMaxSize()
-                .scale(innerScale)
-                .clip(CircleShape)
-                .background(Color.White)
+                .fillMaxSize(innerSizeFraction)
+                .scale(innerPressScale)
+                .clip(RoundedCornerShape(cornerRadius))
+                .background(innerColor)
         )
     }
 }
