@@ -72,6 +72,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -93,6 +94,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import coil.compose.AsyncImage
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -105,6 +107,9 @@ private const val SAMSUNG_GALLERY_PACKAGE = "com.sec.android.gallery3d"
 
 private val ZOOM_PRESETS = listOf(0.5f, 1f, 2f, 3f, 5f, 10f)
 private val TIMER_OPTIONS = listOf(0, 3, 10)
+
+/** How long the front camera's simulated screen-flash stays lit before the shutter fires. */
+private const val FRONT_FLASH_DURATION_MS = 1000L
 
 /** The photo aspect ratios the "sizes" control cycles through. */
 private enum class CaptureAspect(val label: String) {
@@ -192,6 +197,7 @@ private fun CameraContent() {
     val lifecycleOwner = LocalLifecycleOwner.current
     val haptics = LocalHapticFeedback.current
     val mainExecutor: Executor = remember { ContextCompat.getMainExecutor(context) }
+    val scope = rememberCoroutineScope()
 
     var lensFacing by remember { mutableStateOf(CameraSelector.LENS_FACING_BACK) }
     var lastPhotoUri by remember { mutableStateOf<Uri?>(null) }
@@ -203,7 +209,8 @@ private fun CameraContent() {
     var freezeFrame by remember { mutableStateOf<Bitmap?>(null) }
     var timerSeconds by remember { mutableIntStateOf(0) }
     var countdownValue by remember { mutableIntStateOf(0) }
-    var isCounting by remember { mutableStateOf(false) }
+    var isBusy by remember { mutableStateOf(false) }
+    var frontFlashActive by remember { mutableStateOf(false) }
     var captureAspect by remember { mutableStateOf(CaptureAspect.FULL) }
 
     var imageCapture by remember {
@@ -237,49 +244,63 @@ private fun CameraContent() {
         }
     }
 
-    val runCapture: () -> Unit = {
-        haptics.performHapticFeedback(HapticFeedbackType.LongPress)
-        // Freeze the last preview frame instead of flashing the screen white, so the
-        // user gets clear feedback that a photo was taken without a jarring white pulse.
-        freezeFrame = previewView.bitmap
-        imageCapture.flashMode = if (flashOn) ImageCapture.FLASH_MODE_ON else ImageCapture.FLASH_MODE_OFF
-        takePhoto(context, imageCapture, mainExecutor, captureAspect) { uri ->
-            lastPhotoUri = uri
-            capturedPop = true
-        }
-    }
-    val currentRunCapture by rememberUpdatedState(runCapture)
-
-    val performCapture: () -> Unit = {
-        if (isCounting) {
-            // Ignore extra presses while a countdown is already running.
-        } else if (timerSeconds > 0) {
-            isCounting = true
-            countdownValue = timerSeconds
-        } else {
-            currentRunCapture()
-        }
-    }
-    val currentPerformCapture by rememberUpdatedState(performCapture)
-
-    LaunchedEffect(isCounting, countdownValue) {
-        if (isCounting) {
-            if (countdownValue > 0) {
-                delay(1000)
-                countdownValue -= 1
-            } else {
-                isCounting = false
-                currentRunCapture()
-            }
-        }
-    }
-
     LaunchedEffect(freezeFrame) {
         if (freezeFrame != null) {
             delay(500)
             freezeFrame = null
         }
     }
+
+    val performCapture: () -> Unit = capture@{
+        if (isBusy) return@capture
+        scope.launch {
+            isBusy = true
+            try {
+                // Self-timer countdown, shown full-screen before the shutter fires.
+                if (timerSeconds > 0) {
+                    for (secondsLeft in timerSeconds downTo 1) {
+                        countdownValue = secondsLeft
+                        delay(1000)
+                    }
+                    countdownValue = 0
+                }
+
+                haptics.performHapticFeedback(HapticFeedbackType.LongPress)
+
+                // Front cameras usually have no physical flash, so simulate one by
+                // lighting up the whole screen for a second before the photo is taken.
+                val useFrontScreenFlash = lensFacing == CameraSelector.LENS_FACING_FRONT && flashOn
+                if (useFrontScreenFlash) {
+                    frontFlashActive = true
+                    delay(FRONT_FLASH_DURATION_MS)
+                } else {
+                    // Freeze the last preview frame instead of a white pulse, so the
+                    // user gets clear feedback that a photo was taken without a flash.
+                    freezeFrame = previewView.bitmap
+                }
+
+                imageCapture.flashMode = if (!useFrontScreenFlash && flashOn) {
+                    ImageCapture.FLASH_MODE_ON
+                } else {
+                    ImageCapture.FLASH_MODE_OFF
+                }
+
+                val uri = capturePhoto(context, imageCapture, mainExecutor, captureAspect)
+
+                if (useFrontScreenFlash) {
+                    frontFlashActive = false
+                }
+
+                if (uri != null) {
+                    lastPhotoUri = uri
+                    capturedPop = true
+                }
+            } finally {
+                isBusy = false
+            }
+        }
+    }
+    val currentPerformCapture by rememberUpdatedState(performCapture)
 
     // Let the hardware volume keys act as a physical shutter button, like Samsung Camera.
     DisposableEffect(Unit) {
@@ -300,6 +321,11 @@ private fun CameraContent() {
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize()
             )
+        }
+
+        // Front-camera screen flash: lights the whole screen white as a makeshift flash.
+        if (frontFlashActive) {
+            Box(modifier = Modifier.fillMaxSize().background(Color.White))
         }
 
         // Top-left: settings gear, reserved for future options.
@@ -332,8 +358,12 @@ private fun CameraContent() {
                 )
             }
 
+            // Back camera needs a physical flash unit; front camera always offers the
+            // simulated screen-flash, so its button is never gated on hasFlashUnit().
+            val flashAvailable = camera?.cameraInfo?.hasFlashUnit() == true ||
+                lensFacing == CameraSelector.LENS_FACING_FRONT
             AnimatedVisibility(
-                visible = camera?.cameraInfo?.hasFlashUnit() == true,
+                visible = flashAvailable,
                 enter = fadeIn(),
                 exit = fadeOut()
             ) {
@@ -355,7 +385,7 @@ private fun CameraContent() {
         }
 
         // Countdown overlay while a timed capture is pending.
-        if (isCounting && countdownValue > 0) {
+        if (countdownValue > 0) {
             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                 Text(
                     text = countdownValue.toString(),
@@ -660,13 +690,13 @@ private suspend fun Context.getCameraProvider(): ProcessCameraProvider =
         )
     }
 
-private fun takePhoto(
+/** Takes a photo and suspends until it is saved, returning the saved [Uri] or null on failure. */
+private suspend fun capturePhoto(
     context: Context,
     imageCapture: ImageCapture,
     executor: Executor,
-    aspect: CaptureAspect,
-    onSaved: (Uri) -> Unit
-) {
+    aspect: CaptureAspect
+): Uri? = suspendCancellableCoroutine { continuation ->
     val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(System.currentTimeMillis())
     val contentValues = ContentValues().apply {
         put(MediaStore.MediaColumns.DISPLAY_NAME, "IMG_$timestamp.jpg")
@@ -685,19 +715,16 @@ private fun takePhoto(
         executor,
         object : ImageCapture.OnImageSavedCallback {
             override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                val uri = output.savedUri ?: return
-                if (aspect == CaptureAspect.RATIO_1_1) {
-                    Thread {
-                        cropToSquare(context, uri)
-                        executor.execute { onSaved(uri) }
-                    }.start()
-                } else {
-                    onSaved(uri)
+                val uri = output.savedUri
+                if (uri != null && aspect == CaptureAspect.RATIO_1_1) {
+                    cropToSquare(context, uri)
                 }
+                if (continuation.isActive) continuation.resume(uri)
             }
 
             override fun onError(exc: ImageCaptureException) {
                 Log.e("CameraApp", "Photo capture failed", exc)
+                if (continuation.isActive) continuation.resume(null)
             }
         }
     )
