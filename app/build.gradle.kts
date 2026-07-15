@@ -21,23 +21,23 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-          ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
-          externalNativeBuild {
-              cmake {
-                  arguments += "-DANDROID_STL=none"
-                  cFlags   += "-std=c11"
-              }
-          }
-      }
+        ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
+        externalNativeBuild {
+            cmake {
+                arguments += "-DANDROID_STL=none"
+                cFlags   += "-std=c11"
+            }
+        }
+    }
 
-      externalNativeBuild {
-          cmake {
-              path    = file("src/main/cpp/CMakeLists.txt")
-              version = "3.22.1"
-          }
-      }
+    externalNativeBuild {
+        cmake {
+            path    = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
 
-      buildTypes {
+    buildTypes {
         release {
             // Signed with the auto-generated debug keystore so CI can produce an
             // installable release APK without managing a production signing secret.
