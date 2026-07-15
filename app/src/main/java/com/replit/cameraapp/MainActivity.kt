@@ -448,6 +448,10 @@ private fun CameraContent(
         }
     }
 
+    var imageCapture by remember {
+        mutableStateOf(buildImageCapture(CaptureAspect.FULL))
+    }
+
     // Keep the ImageCapture use case informed of device rotation so every JPEG
     // is tagged with the correct EXIF orientation — even when the device is
     // held sideways while the UI stays portrait-locked.
@@ -459,10 +463,6 @@ private fun CameraContent(
     // targetRotation, so landscape-held recordings play back the right way up.
     LaunchedEffect(deviceRotation, videoCapture) {
         videoCapture?.targetRotation = deviceRotation
-    }
-
-    var imageCapture by remember {
-        mutableStateOf(buildImageCapture(CaptureAspect.FULL))
     }
     // COMPATIBLE (TextureView-backed) mode is required so the live preview actually
     // participates in Compose's own rendering layer -- that's what lets the filter
